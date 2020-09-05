@@ -100,7 +100,7 @@ public abstract class AbstractDMLBaseExecutor<T, S extends Statement> extends Ba
             // 执行 ConnectionProxy.LockRetryPolicy.doRetryOnLockConflict() 方法
             // 当全局锁冲突的时候，尝试重新获取 锁: 30ms执行一次，执行10次还不行 就报错处理
             return new LockRetryPolicy(connectionProxy.getTargetConnection()).execute(() -> {
-                // 关闭自动提交
+                // 关闭自动提交,同时
                 T result = executeAutoCommitFalse(args);
                 // 重点:   1.doCommit();
                 // 2.processGlobalTransactionCommit();
