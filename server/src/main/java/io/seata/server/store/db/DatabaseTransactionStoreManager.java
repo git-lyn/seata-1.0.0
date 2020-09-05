@@ -117,9 +117,12 @@ public class DatabaseTransactionStoreManager extends AbstractTransactionStoreMan
         } else if (LogOperation.GLOBAL_REMOVE.equals(logOperation)) {
             return logStore.deleteGlobalTransactionDO(convertGlobalTransactionDO(session));
         } else if (LogOperation.BRANCH_ADD.equals(logOperation)) {
+            // 进行branch_table数据库表中数据添加
             return logStore.insertBranchTransactionDO(convertBranchTransactionDO(session));
         } else if (LogOperation.BRANCH_UPDATE.equals(logOperation)) {
+            // 进行branch_table修改操作, 修改status属性的值为0或者1
             return logStore.updateBranchTransactionDO(convertBranchTransactionDO(session));
+            // 从branch_table删除分支数据
         } else if (LogOperation.BRANCH_REMOVE.equals(logOperation)) {
             return logStore.deleteBranchTransactionDO(convertBranchTransactionDO(session));
         } else {

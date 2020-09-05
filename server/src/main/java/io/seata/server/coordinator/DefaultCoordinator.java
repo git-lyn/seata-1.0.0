@@ -179,6 +179,14 @@ public class DefaultCoordinator extends AbstractTCInboundHandler
             request.getTransactionName(), request.getTimeout()));
     }
 
+    /**
+     * 服务器接受客户端的全局事务提交，进行处理
+     *  客户端: TransactionalTemplate#commitTransaction()
+     * @param request    the request
+     * @param response   the response
+     * @param rpcContext the rpc context
+     * @throws TransactionException
+     */
     @Override
     protected void doGlobalCommit(GlobalCommitRequest request, GlobalCommitResponse response, RpcContext rpcContext)
         throws TransactionException {
@@ -206,18 +214,35 @@ public class DefaultCoordinator extends AbstractTCInboundHandler
 
     }
 
+    /**
+     * 分支事务注册
+     * @param request    the request
+     * @param response   the response
+     * @param rpcContext the rpc context
+     * @throws TransactionException
+     */
     @Override
     protected void doBranchRegister(BranchRegisterRequest request, BranchRegisterResponse response,
                                     RpcContext rpcContext) throws TransactionException {
+        // 执行的业务逻辑是DefaultCore.branchRegister()来注册分支事务
         response.setBranchId(
             core.branchRegister(request.getBranchType(), request.getResourceId(), rpcContext.getClientId(),
                 request.getXid(), request.getApplicationData(), request.getLockKey()));
 
     }
 
+    /**
+     * 接受客户端发送的 分支事务注册成功或者失败的信息
+     *   ConnectionProxy.report()
+     * @param request    the request
+     * @param response
+     * @param rpcContext the rpc context
+     * @throws TransactionException
+     */
     @Override
     protected void doBranchReport(BranchReportRequest request, BranchReportResponse response, RpcContext rpcContext)
         throws TransactionException {
+        // 修改通知状态: branch_table status属性
         core.branchReport(request.getBranchType(), request.getXid(), request.getBranchId(), request.getStatus(),
             request.getApplicationData());
 
@@ -413,6 +438,7 @@ public class DefaultCoordinator extends AbstractTCInboundHandler
     }
 
     /**
+     * 处理重试提交的任务
      * Handle retry committing.
      */
     protected void handleRetryCommitting() {
@@ -423,9 +449,11 @@ public class DefaultCoordinator extends AbstractTCInboundHandler
         long now = System.currentTimeMillis();
         for (GlobalSession committingSession : committingSessions) {
             try {
+                // 判断是否超时
                 if (isRetryTimeout(now, MAX_COMMIT_RETRY_TIMEOUT.toMillis(), committingSession.getBeginTime())) {
                     /**
                      * Prevent thread safety issues
+                     * 防止线程安全问题
                      */
                     SessionHolder.getRetryCommittingSessionManager().removeGlobalSession(committingSession);
                     LOGGER.error("GlobalSession commit retry timeout [{}]", committingSession.getXid());
@@ -451,9 +479,11 @@ public class DefaultCoordinator extends AbstractTCInboundHandler
     }
 
     /**
+     * 处理异步提交
      * Handle async committing.
      */
     protected void handleAsyncCommitting() {
+        // 获取所有的异步提交的数据
         Collection<GlobalSession> asyncCommittingSessions = SessionHolder.getAsyncCommittingSessionManager()
             .allSessions();
         if (CollectionUtils.isEmpty(asyncCommittingSessions)) {
@@ -466,6 +496,7 @@ public class DefaultCoordinator extends AbstractTCInboundHandler
                     continue;
                 }
                 asyncCommittingSession.addSessionLifecycleListener(SessionHolder.getRootSessionManager());
+                // 设置状态 retrying为true  执行重试机制
                 core.doGlobalCommit(asyncCommittingSession, true);
             } catch (TransactionException ex) {
                 LOGGER.error("Failed to async committing [{}] {} {}", asyncCommittingSession.getXid(), ex.getCode(),
@@ -509,7 +540,7 @@ public class DefaultCoordinator extends AbstractTCInboundHandler
                 LOGGER.info("Exception retry rollbacking ... ", e);
             }
         }, 0, ROLLBACKING_RETRY_PERIOD, TimeUnit.MILLISECONDS);
-
+        // 重试提交的定时任务
         retryCommitting.scheduleAtFixedRate(() -> {
             try {
                 handleRetryCommitting();
@@ -517,7 +548,7 @@ public class DefaultCoordinator extends AbstractTCInboundHandler
                 LOGGER.info("Exception retry committing ... ", e);
             }
         }, 0, COMMITTING_RETRY_PERIOD, TimeUnit.MILLISECONDS);
-
+        // 异步提交的定时任务
         asyncCommitting.scheduleAtFixedRate(() -> {
             try {
                 handleAsyncCommitting();

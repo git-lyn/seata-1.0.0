@@ -100,11 +100,18 @@ public class LockStoreDataBaseDAO implements LockStore, Initialize {
         return acquireLock(Collections.singletonList(lockDO));
     }
 
+    /**
+     * ====================================真正加锁的逻辑
+     * @param lockDOs the lock d os
+     * @return
+     */
     @Override
     public boolean acquireLock(List<LockDO> lockDOs) {
+        //准备数据库连接等
         Connection conn = null;
         PreparedStatement ps = null;
         ResultSet rs = null;
+        //数据库存在函数的keys
         Set<String> dbExistedRowKeys = new HashSet<>();
         boolean originalAutoCommit = true;
         if (lockDOs.size() > 1) {
@@ -115,12 +122,20 @@ public class LockStoreDataBaseDAO implements LockStore, Initialize {
             if (originalAutoCommit = conn.getAutoCommit()) {
                 conn.setAutoCommit(false);
             }
+
+            /**
+             * 假如我们的分支事务 需要更新的资源是productId 为1 和2
+             * 那么他的全局锁的key是product:1,2 而List<LockDO>.size为2
+             * 所以下面代码拼接为(?,?) 若只有productId为1的那么他的拼接(?)
+             */
+
             //check lock
             StringJoiner sj = new StringJoiner(",");
             for (int i = 0; i < lockDOs.size(); i++) {
                 sj.add("?");
             }
             boolean canLock = true;
+            //执行查询我们的lock_table
             //query
             String checkLockSQL = LockStoreSqls.getCheckLockableSql(lockTable, sj.toString(), dbType);
             ps = conn.prepareStatement(checkLockSQL);
@@ -128,9 +143,23 @@ public class LockStoreDataBaseDAO implements LockStore, Initialize {
                 ps.setString(i + 1, lockDOs.get(i).getRowKey());
             }
             rs = ps.executeQuery();
+            // 获取全局事务参与者所属的分布式事务全局ID
             String currentXID = lockDOs.get(0).getXid();
+            // 循环数据库
             while (rs.next()) {
+                // 通过查询到数据库中的数据
                 String dbXID = rs.getString(ServerTableColumnsName.LOCK_TABLE_XID);
+                /**
+                 * 重点  ！！！！！！！！！！！！
+                 *
+                 * 当前的锁和数据库中的全局事务ID不相等，说明其他的分布式事务真正对该记录进行操作
+                 *  线程1对应的分布式事务 对product:1 进行加锁操作
+                 * 线程2对应的分布式事务对product:1进行操作,那么去数据库查询出来的全局
+                 * xid和当前线程2对应的xid是不相等的,那么就加锁失败。
+                 * 对应的线程1 global-table表中的rowkey为product:1 xid(全局事务id)为abc，
+                 *      线程2 global-table表中的rowkey为product:1 xid(全局事务id)为hgfff
+                 *  两个事务才操作同一条数据, 会造成全局锁冲突, 导致加锁失败
+                 */
                 if (!StringUtils.equals(dbXID, currentXID)) {
                     if (LOGGER.isInfoEnabled()) {
                         String dbPk = rs.getString(ServerTableColumnsName.LOCK_TABLE_PK);
@@ -139,18 +168,25 @@ public class LockStoreDataBaseDAO implements LockStore, Initialize {
                         LOGGER.info("Global lock on [{}:{}] is holding by xid {} branchId {}", dbTableName, dbPk, dbXID,
                             dbBranchId);
                     }
+                    //取反操作，直接加锁失败
                     canLock &= false;
+                    //跳出循环
                     break;
                 }
+                //收集数据库中操作的行锁的key
                 dbExistedRowKeys.add(rs.getString(ServerTableColumnsName.LOCK_TABLE_ROW_KEY));
             }
-
+            //加锁失败直接返回
             if (!canLock) {
                 conn.rollback();
                 return false;
             }
             List<LockDO> unrepeatedLockDOs = null;
+            //线程1：分布式事务product:1,那么数据库加锁成功
+            //后面线程1:有执行一次语句 product:1,2 那么dbExistedRowKeys[1]
             if (CollectionUtils.isNotEmpty(dbExistedRowKeys)) {
+                // 进行重复数据sql的去重操作
+                //lockDOs[1,2] 过滤后unrepeatedLockDOs [2]
                 unrepeatedLockDOs = lockDOs.stream().filter(lockDO -> !dbExistedRowKeys.contains(lockDO.getRowKey()))
                     .collect(Collectors.toList());
             } else {
@@ -163,6 +199,8 @@ public class LockStoreDataBaseDAO implements LockStore, Initialize {
             //lock
             if (unrepeatedLockDOs.size() == 1) {
                 LockDO lockDO = unrepeatedLockDOs.get(0);
+                //进行加锁,说白了就是保存数据库
+                // 往lock_table
                 if (!doAcquireLock(conn, lockDO)) {
                     if (LOGGER.isInfoEnabled()) {
                         LOGGER.info("Global lock acquire failed, xid {} branchId {} pk {}", lockDO.getXid(), lockDO.getBranchId(), lockDO.getPk());

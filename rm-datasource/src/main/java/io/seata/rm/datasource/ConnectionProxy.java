@@ -214,23 +214,27 @@ public class ConnectionProxy extends AbstractConnectionProxy {
     private void processGlobalTransactionCommit() throws SQLException {
         try {
             // 分支事务注册=============可能抛出LockConflictException异常
+            // 调用 DefaultCoordinator.doBranchRegister
             register();
         } catch (TransactionException e) {
             // 会抛出全局锁异常
             recognizeLockKeyConflictException(e, context.buildLockKeys());
         }
-
         try {
+            //保存我们的前置后置镜像到业务数据库中的undoLog表
             if (context.hasUndoLog()) {
                 UndoLogManagerFactory.getUndoLogManager(this.getDbType()).flushUndoLogs(this);
             }
+            //提交本地事务
             targetConnection.commit();
         } catch (Throwable ex) {
             LOGGER.error("process connectionProxy commit error: {}", ex.getMessage(), ex);
+            //上报分支事务提交失败, 和seata-server进行通信 默认发送5次通知
             report(false);
             throw new SQLException(ex);
         }
         if (IS_REPORT_SUCCESS_ENABLE) {
+            //上报分支事务本地提交成功, 和seata-server进行通信 默认发送5次通知
             report(true);
         }
         context.reset();

@@ -270,6 +270,7 @@ public class BranchSession implements Lockable, Comparable<BranchSession>, Sessi
 
     @Override
     public boolean lock() throws TransactionException {
+        //调用加锁管理器默认是:DefaultLockManager 来加锁
         return LockerFactory.getLockManager().acquireLock(this);
     }
 

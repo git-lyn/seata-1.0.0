@@ -63,11 +63,24 @@ public class DefaultCore implements Core {
         this.resourceManagerInbound = resourceManagerInbound;
     }
 
+    /**
+     *  用于分支事务的注册
+     * @param branchType the branch type
+     * @param resourceId the resource id
+     * @param clientId   the client id
+     * @param xid        the xid
+     * @param applicationData the context
+     * @param lockKeys   the lock keys
+     * @return
+     * @throws TransactionException
+     */
     @Override
     public Long branchRegister(BranchType branchType, String resourceId, String clientId, String xid,
                                String applicationData, String lockKeys) throws TransactionException {
+        // 从数据库中的global_table获取全局事务
         GlobalSession globalSession = assertGlobalSessionNotNull(xid, false);
         return globalSession.lockAndExcute(() -> {
+            // 如果active属性不为true 就报错
             if (!globalSession.isActive()) {
                 throw new GlobalTransactionException(GlobalTransactionNotActive, String
                     .format("Could not register branch into global session xid = %s status = %s",
@@ -79,15 +92,29 @@ public class DefaultCore implements Core {
                     .format("Could not register branch into global session xid = %s status = %s while expecting %s",
                         globalSession.getXid(), globalSession.getStatus(), GlobalStatus.Begin));
             }
+            // 添加 DataBaseSessionManager
+            // //添加监听器，用于监听分支事务的状态保存到数据库中
             globalSession.addSessionLifecycleListener(SessionHolder.getRootSessionManager());
+            //获取创建一个分支事务对象
             BranchSession branchSession = SessionHelper.newBranchByGlobal(globalSession, branchType, resourceId,
                 applicationData, lockKeys, clientId);
+
+            /**
+             *
+             * 真正的核心逻辑是这一块，申请全局锁的逻辑
+             *
+             * 服务端进行判断是否加锁成功；
+             * 如果有冲突,进行处理全局锁冲突
+             * 同时进行  行锁收集
+             */
+
             if (!branchSession.lock()) {
                 throw new BranchTransactionException(LockKeyConflict, String
                     .format("Global lock acquire failed xid = %s branchId = %s", globalSession.getXid(),
                         branchSession.getBranchId()));
             }
             try {
+                //保存分支事务到数据库中
                 globalSession.addBranch(branchSession);
             } catch (RuntimeException ex) {
                 branchSession.unlock();
@@ -121,6 +148,9 @@ public class DefaultCore implements Core {
                 String.format("Could not found branch session xid = %s branchId = %s", xid, branchId));
         }
         globalSession.addSessionLifecycleListener(SessionHolder.getRootSessionManager());
+        /**
+         * 修改 branch_table 的属性 status的值
+         */
         globalSession.changeBranchStatus(branchSession, status);
 
         LOGGER.info("Successfully branch report xid = {}, branchId = {}", globalSession.getXid(),
@@ -155,19 +185,31 @@ public class DefaultCore implements Core {
         return session.getXid();
     }
 
+    /**
+     * 进行全局事务的提交
+     * 有bug:  GlobalTransactionDO globalTransactionDO = new GlobalTransactionDO();
+     * @param xid XID of the global transaction.
+     * @return
+     * @throws TransactionException
+     */
     @Override
     public GlobalStatus commit(String xid) throws TransactionException {
+        //数据库查询GlobalTable
         GlobalSession globalSession = SessionHolder.findGlobalSession(xid);
         if (globalSession == null) {
             return GlobalStatus.Finished;
         }
+        //添加一个session监听 用于操作数据库
         globalSession.addSessionLifecycleListener(SessionHolder.getRootSessionManager());
         // just lock changeStatus
         boolean shouldCommit = globalSession.lockAndExcute(() -> {
             //the lock should release after branch commit
+            //close操作 就是修改GlobalSession的标志为 active为false，防止后续的分支事务注册上来
+            //clean 释放全局锁,
             globalSession
                 .closeAndClean(); // Highlight: Firstly, close the session, then no more branch can be registered.
             if (globalSession.getStatus() == GlobalStatus.Begin) {
+                //修改全局事务的状态
                 globalSession.changeStatus(GlobalStatus.Committing);
                 return true;
             }
@@ -177,14 +219,24 @@ public class DefaultCore implements Core {
             return globalSession.getStatus();
         }
         if (globalSession.canBeCommittedAsync()) {
+            // 进行异步的全局事务提交, 默认的方式
             asyncCommit(globalSession);
             return GlobalStatus.Committed;
         } else {
+            // 处理全局事务提交, 进行同步处理
+            // 服务端进行删除三张表的记录
             doGlobalCommit(globalSession, false);
         }
         return globalSession.getStatus();
     }
 
+    /**
+     * 处理全局事务提交
+     * 服务端进行删除三张表的记录
+     * @param globalSession the global session
+     * @param retrying      the retrying
+     * @throws TransactionException
+     */
     @Override
     public void doGlobalCommit(GlobalSession globalSession, boolean retrying) throws TransactionException {
         //start committing event
@@ -247,23 +299,34 @@ public class DefaultCore implements Core {
                 }
                 throw new TransactionException(ex);
             }
-        } else {
+        } else { // 正常的执行逻辑
+            // 获取所有的分支事务
             for (BranchSession branchSession : globalSession.getSortedBranches()) {
                 BranchStatus currentStatus = branchSession.getStatus();
+                // PhaseOne_Failed  如果第一阶段就失败了, 就直接删除该session, 本地业务表没有记录
+                // 删除branch_table分支中的数据
                 if (currentStatus == BranchStatus.PhaseOne_Failed) {
                     globalSession.removeBranch(branchSession);
                     continue;
                 }
                 try {
+                    /**
+                     *  与客户端进行通信
+                     * 通知客户端进行删除业务表中的undo_log日志数据,接收客户端返回的标志 branchStatus
+                     */
                     BranchStatus branchStatus = resourceManagerInbound.branchCommit(branchSession.getBranchType(),
                         branchSession.getXid(), branchSession.getBranchId(), branchSession.getResourceId(),
                         branchSession.getApplicationData());
 
                     switch (branchStatus) {
+                        // 阶段2提交了
                         case PhaseTwo_Committed:
                             globalSession.removeBranch(branchSession);
                             continue;
+                            // 阶段2提交失败, 无法进行重试
                         case PhaseTwo_CommitFailed_Unretryable:
+                            // 执行逻辑 branchSession.getBranchType() == BranchType.TCC
+                            // 默认是正确的
                             if (globalSession.canBeCommittedAsync()) {
                                 LOGGER.error("By [{}], failed to commit branch {}", branchStatus, branchSession);
                                 continue;

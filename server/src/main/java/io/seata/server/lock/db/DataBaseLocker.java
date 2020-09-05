@@ -61,6 +61,9 @@ public class DataBaseLocker extends AbstractLocker {
             return true;
         }
         try {
+            //通过SPI的机制去读取meta‐inf/service/io.seata.core.store.LockStore
+            // LockStoreDataBaseDAO
+            // //真正的加锁逻辑
             return lockStore.acquireLock(convertToLockDO(locks));
         } catch (StoreException e) {
             throw e;
